@@ -1,0 +1,93 @@
+# Phase 2 — Assessment
+
+Deliverables in `labs/phase02/`. Pass mark 75/100.
+
+---
+
+## Task 1 — Annotated commit trace (20 pts)
+Using `tracevfs`, capture traces for `journal_mode` ∈ {DELETE, TRUNCATE, PERSIST, WAL} of
+the *same* workload (one CREATE TABLE + one INSERT inside an explicit transaction).
+
+In `trace-notes.md`:
+- side-by-side table: number of writes, number of syncs, number of lock escalations,
+  and what the commit point is in each mode
+- annotate the DELETE trace line-by-line with the 11 steps from `knowledge.md` §2.3
+- answer: which mode is fastest for many small transactions, and why
+
+*Full marks:* every sync in the DELETE trace is explained in terms of what invariant it
+protects.
+
+---
+
+## Task 2 — Journal format decode (15 pts)
+`journal-decode.md`: a hexdump of a live `-journal` file with all header fields decoded by
+hand, plus one complete page record (pgno, data start/end offsets, checksum) with the
+checksum recomputed by your own code.
+
+*Full marks:* your independently computed checksum matches SQLite's.
+
+---
+
+## Task 3 — Locking experiments (15 pts)
+`locking-notes.md` must contain, with reproductions:
+1. A table of BEGIN / BEGIN IMMEDIATE / BEGIN EXCLUSIVE → lock taken and when
+2. A demonstration that readers are not blocked by a RESERVED writer
+3. The deferred-transaction upgrade deadlock, and its fix
+4. A demonstration that `busy_timeout` helps in one case and not the other, with an
+   explanation of why
+
+---
+
+## Task 4 — ⭐ Custom VFS (25 pts)
+Deliver `xorvfs.c` (or another real transform: compression, quota enforcement, latency
+injection, read-only enforcement):
+
+- [ ] registers correctly, selectable via `sqlite3_open_v2` and via `file:x?vfs=` (5)
+- [ ] correctly wraps all iVersion-2 methods (5)
+- [ ] the transform survives a full workload: create, insert 10k rows, delete, vacuum,
+      reopen, `PRAGMA integrity_check` (10)
+- [ ] documented handling of the journal/WAL files and of partial (100-byte) reads (5)
+
+*Stretch (+10):* add fault injection — fail the Nth write, or the Nth sync, and verify
+SQLite either recovers or reports a clean error, never corruption. Loop N from 1..200.
+That is a miniature version of what SQLite's own `test6.c` does.
+
+---
+
+## Task 5 — Crash and durability report (15 pts)
+`crash-report.md` with data from Lab 2.6:
+- table: (journal_mode × synchronous) → runs, integrity failures, rows surviving
+- explain why `kill -9` is *not* a power-failure test
+- run `test/crash.test` from the real suite and summarize what `src/test6.c` simulates
+- state precisely what `synchronous=NORMAL` risks in rollback mode vs. in WAL mode
+
+---
+
+## Task 6 — Pager state machine walkthrough (10 pts)
+`pager-states.md`: a debugger-derived trace of `eState`/`eLock` at ≥6 breakpoints during a
+single transaction, plus a hand-drawn state diagram annotated with the function that causes
+each transition.
+
+---
+
+## Task 7 — Performance writeup (bonus 10 pts)
+`durability-cost.md`: measured cost of fsync on your machine, transactions/sec for
+1/10/100/1000 rows per transaction, across journal modes. Include one paragraph of advice
+you would give an application team.
+
+---
+
+## Rubric
+| Band | Meaning |
+|---|---|
+| 90–100 | You could implement a VFS for a new platform and debug a corruption report |
+| 75–89 | Solid understanding of ACID mechanics and locking |
+| 60–74 | Traces understood, VFS shaky — redo Task 4 |
+| <60 | Redo Labs 2.1 and 2.6 |
+
+## Exit criteria (hard gate)
+- [ ] You can recite the 11-step commit sequence and say what a crash at each step does
+- [ ] You can name all five lock states and what each permits
+- [ ] Your custom VFS passes `PRAGMA integrity_check` after a real workload
+- [ ] You can explain hot-journal detection's four conditions
+- [ ] MCQ ≥ 20/25

@@ -1,0 +1,33 @@
+# SQLite amalgamation — download it, don't vendor it (11 MB)
+# curl -O https://sqlite.org/2025/sqlite-amalgamation-3500400.zip && unzip sqlite-amalgamation-*.zip
+sqlite-amalgamation-*/
+sqlite-amalgamation-*.zip
+sqlite-src/
+
+# compiled lab tools
+labs/*/dbparse
+labs/*/tracevfs
+labs/*/minibtree
+labs/*/walparse
+labs/*/tokdump
+labs/*/sqlite3-ext
+labs/*/sqlite3-trace
+labs/*/sqlite3-stat4
+labs/*/logest
+labs/*/authz
+labs/*/driver
+labs/*/udf
+*.o
+*.so
+*.dylib
+*.dSYM/
+
+# databases produced by the labs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.wal
+
+# macOS
+.DS_Store

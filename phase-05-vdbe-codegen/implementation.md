@@ -1,0 +1,346 @@
+# Phase 5 — Implementation Labs: Read, Trace, and Extend the VM
+
+---
+
+## Lab 5.1 — Bytecode reading drills
+
+```sh
+mkdir -p ~/Desktop/sqllite/labs/phase05 && cd ~/Desktop/sqllite/labs/phase05
+sqlite3 v.db <<'SQL'
+CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, age INT);
+CREATE INDEX i_age ON users(age);
+CREATE TABLE orders(id INTEGER PRIMARY KEY, uid INT, total REAL);
+INSERT INTO users VALUES(1,'ada',36),(2,'linus',54),(3,'grace',45);
+INSERT INTO orders VALUES(1,1,10.5),(2,1,20.0),(3,2,5.0);
+SQL
+```
+
+For **each** query below, capture `EXPLAIN` output and write a line-by-line explanation in
+`labs/phase05/drills.md`:
+
+```sql
+1.  SELECT * FROM users;
+2.  SELECT name FROM users WHERE id=2;
+3.  SELECT id FROM users WHERE age=45;                 -- covering index
+4.  SELECT name FROM users WHERE age>40;               -- DeferredSeek
+5.  SELECT count(*) FROM users;                        -- OP_Count
+6.  SELECT max(age) FROM users;                        -- min/max optimization
+7.  SELECT name FROM users ORDER BY name;              -- sorter
+8.  SELECT name FROM users ORDER BY age;               -- index gives order
+9.  SELECT DISTINCT age FROM users;
+10. SELECT u.name,o.total FROM users u JOIN orders o ON o.uid=u.id;
+11. SELECT u.name FROM users u LEFT JOIN orders o ON o.uid=u.id WHERE o.id IS NULL;
+12. SELECT age,count(*) FROM users GROUP BY age HAVING count(*)>1;
+13. SELECT name FROM users WHERE id IN (SELECT uid FROM orders);
+14. SELECT name,(SELECT count(*) FROM orders WHERE uid=users.id) FROM users;
+15. INSERT INTO users VALUES(9,'x',1);
+16. UPDATE users SET age=age+1 WHERE id=1;
+17. DELETE FROM users WHERE age<40;
+18. DELETE FROM users;                                  -- truncate optimization
+19. WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<5) SELECT * FROM c;
+20. SELECT name FROM users WHERE name LIKE 'a%';        -- LIKE optimization
+```
+
+For each, answer: how many cursors? is there a loop? is there a sorter? which opcode does
+the I/O? where is the transaction started?
+
+**Reference decodings for #4, #2, #3, #10, #12, #15 are in `knowledge.md` §5.3** — check
+yourself against them *after* you try.
+
+---
+
+## Lab 5.2 — The `bytecode()` virtual table (query your own programs)
+
+Verified working on this machine:
+
+```sh
+sqlite3 v.db "SELECT addr,opcode,p1,p2,p3,p4,comment
+              FROM bytecode('SELECT name FROM users WHERE age>40');"
+sqlite3 v.db "SELECT * FROM tables_used('SELECT name FROM users');"
+```
+
+Now do analysis *in SQL*:
+
+```sh
+# opcode histogram of a query
+sqlite3 v.db "SELECT opcode, count(*) FROM bytecode('SELECT u.name,o.total FROM users u
+              JOIN orders o ON o.uid=u.id') GROUP BY opcode ORDER BY 2 DESC;"
+
+# does this query sort?
+sqlite3 v.db "SELECT count(*)>0 AS sorts FROM bytecode('SELECT name FROM users ORDER BY name')
+              WHERE opcode LIKE 'Sorter%';"
+
+# which cursors does it open, and on what?
+sqlite3 v.db "SELECT addr,opcode,p1 AS cursor,p2 AS rootpage,p4
+              FROM bytecode('SELECT name FROM users WHERE age>40')
+              WHERE opcode LIKE 'Open%';"
+```
+
+**Deliverable:** `labs/phase05/bytecode-queries.sql` — a set of reusable analysis queries,
+including one that flags "this query will sort" and one that flags "this query opens a
+table cursor that it only uses for one column" (a covering-index opportunity).
+
+---
+
+## Lab 5.3 — Trace execution instruction by instruction
+
+Needs a `SQLITE_DEBUG` build (Phase 0):
+
+```sh
+~/Desktop/sqllite/sqlite-src/build/sqlite3 v.db <<'SQL'
+PRAGMA vdbe_listing=ON;
+PRAGMA vdbe_trace=ON;
+SELECT name FROM users WHERE age>40;
+SQL
+```
+
+You will get the program listing followed by one line per executed instruction, with
+register contents. Count how many instructions actually ran versus how many exist.
+
+Then add register tracing:
+```sh
+PRAGMA vdbe_addoptrace=ON;
+```
+
+**Deliverable:** `labs/phase05/trace.md` — the full trace of query #4 annotated with the
+loop iterations, plus the answer to: how many `OP_Column` executions occurred, and why is
+it not `rows × columns`?
+
+---
+
+## Lab 5.4 — Profile with scanstatus
+
+Build with `-DSQLITE_ENABLE_STMT_SCANSTATUS`, then:
+
+```sh
+~/Desktop/sqllite/sqlite-src/build/sqlite3 v.db <<'SQL'
+.scanstats on
+SELECT u.name, o.total FROM users u JOIN orders o ON o.uid=u.id WHERE u.age>40;
+SQL
+```
+
+You get per-loop estimated vs. actual row counts. On a big database this is the fastest way
+to find "the planner thought 10 rows, got 4 million".
+
+Build a bigger dataset and find such a case deliberately:
+```sh
+sqlite3 big.db <<'SQL'
+CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, v TEXT);
+CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, v TEXT);
+BEGIN;
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<300000)
+INSERT INTO a SELECT i, i%1000, 'x' FROM c;
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<300000)
+INSERT INTO b SELECT i, i%7, 'y' FROM c;
+CREATE INDEX ia ON a(k);
+CREATE INDEX ib ON b(k);
+COMMIT;
+SQL
+sqlite3 big.db "SELECT count(*) FROM a JOIN b ON a.k=b.k;"      # no ANALYZE yet
+sqlite3 big.db "ANALYZE;"
+sqlite3 big.db "EXPLAIN QUERY PLAN SELECT count(*) FROM a JOIN b ON a.k=b.k;"
+```
+Record the plan before and after `ANALYZE` — this previews Phase 6.
+
+---
+
+## Lab 5.5 — User-defined functions: see `OP_Function` appear
+
+```c
+/* labs/phase05/udf.c — build: cc -o udf udf.c -lsqlite3 */
+#include <stdio.h>
+#include <string.h>
+#include "sqlite3.h"
+
+static void doubleFunc(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  if( sqlite3_value_type(argv[0])==SQLITE_NULL ){ sqlite3_result_null(ctx); return; }
+  sqlite3_result_int64(ctx, 2 * sqlite3_value_int64(argv[0]));
+}
+
+/* an aggregate: sum of squares */
+typedef struct { sqlite3_int64 sum; } SumCtx;
+static void sqStep(sqlite3_context *ctx, int argc, sqlite3_value **argv){
+  SumCtx *p = (SumCtx*)sqlite3_aggregate_context(ctx, sizeof(SumCtx));
+  sqlite3_int64 v = sqlite3_value_int64(argv[0]);
+  if( p ) p->sum += v*v;
+}
+static void sqFinal(sqlite3_context *ctx){
+  SumCtx *p = (SumCtx*)sqlite3_aggregate_context(ctx, 0);
+  sqlite3_result_int64(ctx, p ? p->sum : 0);
+}
+
+int main(void){
+  sqlite3 *db; sqlite3_stmt *st; char *err=0;
+  sqlite3_open(":memory:", &db);
+  sqlite3_create_function(db, "dbl", 1,
+      SQLITE_UTF8|SQLITE_DETERMINISTIC, 0, doubleFunc, 0, 0);
+  sqlite3_create_function(db, "sumsq", 1, SQLITE_UTF8, 0, 0, sqStep, sqFinal);
+  sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1),(2),(3);", 0,0,&err);
+
+  sqlite3_prepare_v2(db, "SELECT dbl(x), sumsq(x) FROM t", -1, &st, 0);
+  while( sqlite3_step(st)==SQLITE_ROW ){
+    printf("%lld %lld\n", sqlite3_column_int64(st,0), sqlite3_column_int64(st,1));
+  }
+  sqlite3_finalize(st);
+  sqlite3_close(db);
+  return 0;
+}
+```
+
+Then look at the bytecode:
+```sh
+sqlite3 :memory: "SELECT * FROM bytecode('SELECT abs(-1), count(*) FROM sqlite_schema');"
+```
+Find `OP_Function` / `OP_PureFunc` and `OP_AggStep` / `OP_AggFinal`. Note how
+`SQLITE_DETERMINISTIC` changes `Function` into `PureFunc`, which lets the optimizer hoist
+the call out of loops. Prove it with a query where the argument is constant.
+
+---
+
+## Lab 5.6 — ⭐ Add a new opcode to the VDBE
+
+This is the real internals exercise of the phase.
+
+**Goal:** add `OP_Hello`, which writes a greeting string into a register, and make a
+built-in function emit it.
+
+```sh
+cd ~/Desktop/sqllite/sqlite-src
+```
+
+1. **Declare the opcode** by adding a `case` with a doc comment in `src/vdbe.c` — the doc
+   comment is what the generator reads:
+
+```c
+/* Opcode: Hello P1 P2 * * *
+** Synopsis: r[P2]='hello ' || P1
+**
+** Write the string "hello <P1>" into register P2.
+*/
+case OP_Hello: {              /* out2 */
+  char *z;
+  pOut = out2Prerelease(p, pOp);
+  z = sqlite3MPrintf(db, "hello %d", pOp->p1);
+  if( z==0 ) goto no_mem;
+  sqlite3VdbeMemSetStr(pOut, z, -1, SQLITE_UTF8, sqlite3_free);
+  break;
+}
+```
+
+2. **Regenerate** `opcodes.h` / `opcodes.c`:
+```sh
+cd build && make opcodes.h opcodes.c && grep -n OP_Hello opcodes.h
+```
+
+3. **Emit it.** Easiest hook: in `src/expr.c`, in `sqlite3ExprCodeTarget()`, add a case for
+   a function named `hello`, or add a grammar-free hack in `select.c`. A cleaner route:
+   register a no-op SQL function `hello(N)` in `func.c` and special-case it in
+   `sqlite3ExprCodeTarget` to emit `OP_Hello` instead of `OP_Function`.
+
+4. **Test:**
+```sh
+make sqlite3 && ./sqlite3 :memory: "SELECT hello(7);"
+./sqlite3 :memory: "SELECT * FROM bytecode('SELECT hello(7)');"
+```
+
+5. **Run the suite** and see whether anything breaks:
+```sh
+make testfixture && ./testfixture ../test/select1.test
+```
+
+Deliverable: `labs/phase05/opcode-patch.diff` + notes on:
+- which files are generated and which you edited
+- what the `/* out2 */` comment does (find it in `mkopcodeh.tcl`)
+- what `out2Prerelease()` is for
+- why `sqlite3VdbeMemSetStr` and not `strcpy`
+
+---
+
+## Lab 5.7 — Read `sqlite3VdbeExec` properly
+
+```sh
+grep -n "case OP_Column:" ~/Desktop/sqllite/sqlite-amalgamation-3500400/sqlite3.c
+grep -n "case OP_Next:"   ~/Desktop/sqllite/sqlite-amalgamation-3500400/sqlite3.c
+grep -n "case OP_MakeRecord:" ~/Desktop/sqllite/sqlite-amalgamation-3500400/sqlite3.c
+```
+
+Read those three cases end to end and answer in `labs/phase05/opcodes-read.md`:
+1. In `OP_Column`, what are `pC->aType[]` and `pC->aOffset[]`, and when are they refilled?
+2. What happens in `OP_Column` when the requested column index exceeds the number of
+   columns in the stored record? Which SQL feature depends on that behaviour?
+3. In `OP_MakeRecord`, how is the header-size varint handled when adding a byte to the
+   header pushes its own varint to 2 bytes?
+4. In `OP_Next`, what does P5 control, and what is `pC->cacheStatus = CACHE_STALE` for?
+5. Find `OP_SeekGE` and explain the `SeekScan` optimization that sometimes precedes it.
+
+---
+
+## Lab 5.8 — Debugger tour
+
+```sh
+lldb ~/Desktop/sqllite/sqlite-src/build/sqlite3
+(lldb) b sqlite3VdbeExec
+(lldb) run v.db
+sqlite> SELECT name FROM users WHERE age>40;
+(lldb) p *p                      # the Vdbe
+(lldb) p p->nOp
+(lldb) call (void)sqlite3VdbePrintOp(0, 0, p->aOp)
+(lldb) p p->aMem[1]
+(lldb) p p->apCsr[0]->uc.pCursor->pgnoRoot
+```
+
+Set a conditional breakpoint on a specific opcode:
+```
+(lldb) b vdbe.c:<line of case OP_Column>
+(lldb) breakpoint modify -c "pOp->p2 == 1"
+```
+
+Deliverable: `labs/phase05/vdbe-session.md` documenting register contents at three points
+during the loop and the cursor's root page.
+
+---
+
+## Lab 5.9 — Measure the cost model in the real world
+
+```sh
+cd ~/Desktop/sqllite/labs/phase05
+# wide table: does column position matter?
+sqlite3 wide.db <<'SQL'
+CREATE TABLE w(c0,c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19);
+BEGIN;
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<500000)
+INSERT INTO w SELECT i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i,i FROM c;
+COMMIT;
+SQL
+echo -n "first column:  "; /usr/bin/time -p sqlite3 wide.db 'SELECT sum(c0) FROM w;' 2>&1|grep real
+echo -n "last  column:  "; /usr/bin/time -p sqlite3 wide.db 'SELECT sum(c19) FROM w;' 2>&1|grep real
+```
+
+Explain the difference using what you learned about `OP_Column` and record parsing.
+Then test the prepared-statement effect:
+
+```sh
+# 10000 separate prepares vs 10000 steps of one prepared statement
+```
+Write a small C program for this; the difference is the cost of parse+codegen, and it is
+large. Put numbers in `labs/phase05/perf.md`.
+
+---
+
+## Lab 5.10 — Build a bytecode diff tool
+
+Write `bcdiff.sh` (or a C/Python program) that takes two SQL queries and prints a
+side-by-side opcode diff using the `bytecode()` vtab:
+
+```sh
+./bcdiff.sh v.db "SELECT name FROM users WHERE age=45" \
+                 "SELECT id   FROM users WHERE age=45"
+```
+
+Use it to answer:
+- What exactly changes when a query becomes covered by an index?
+- What changes when you add `ORDER BY`?
+- What changes when you add `LIMIT 1`?
+- What changes when you replace `IN (SELECT ...)` with a `JOIN`?
+
+Deliverable: the tool + `labs/phase05/bcdiff-findings.md`.

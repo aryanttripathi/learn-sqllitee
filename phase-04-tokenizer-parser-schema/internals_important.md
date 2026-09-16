@@ -1,0 +1,190 @@
+# Phase 4 — Internals Reference: Front End
+
+## File map
+
+| File | Contents |
+|---|---|
+| `tokenize.c` | `sqlite3GetToken()`, `sqlite3RunParser()`, `keywordCode()`, `aiClass[]` |
+| `keywordhash.h` | **generated** by `tool/mkkeywordhash.c` — perfect hash of keywords |
+| `parse.y` | the Lemon grammar + C actions that build the tree |
+| `parse.c` / `parse.h` | **generated** by `tool/lemon.c` |
+| `resolve.c` | `sqlite3ResolveExprNames()`, `lookupName()`, `resolveSelectStep()` |
+| `walker.c` | `sqlite3WalkExpr()`, `sqlite3WalkSelect()` — generic tree traversal |
+| `build.c` | `sqlite3StartTable()`, `sqlite3AddColumn()`, `sqlite3EndTable()`, `sqlite3CreateIndex()`, `sqlite3NestedParse()`, `sqlite3AffinityType()` |
+| `prepare.c` | `sqlite3InitOne()`, `sqlite3InitCallback()`, `sqlite3Prepare()`, schema-cookie checks |
+| `expr.c` | `sqlite3PExpr()`, `sqlite3ExprAlloc()`, `sqlite3ExprDup()`, `sqlite3ExprCollSeq()`, `sqlite3ExprAffinity()`, plus all expression codegen |
+| `callback.c` | collation and function lookup (`sqlite3FindFunction`, `sqlite3FindCollSeq`) |
+| `treeview.c` | `sqlite3TreeViewExpr/Select/SrcList` — debug printing |
+| `alter.c` | ALTER TABLE, including rewriting stored SQL text |
+| `attach.c`, `pragma.c`, `trigger.c`, `fkey.c`, `vtab.c` | statement-specific front ends |
+
+## Key structures (all in `sqliteInt.h`)
+
+```
+Parse       per-statement compile state: pVdbe, nMem, nTab, nLabel, aLabel,
+            pNewTable, pNewIndex, pNewTrigger, pAinc, nested, rc, zErrMsg,
+            constExpr cache, iSelfTab, okConstFactor, disableTriggers
+Expr        one node of an expression tree (see knowledge.md §4.3)
+ExprList    ordered list of Expr + names/aliases/sort flags
+SrcList     the FROM clause; SrcItem per table with iCursor, jointype, colUsed
+Select      one SELECT (pPrior/pNext chain for compounds)
+Table       a table/view: aCol[], pIndex, tnum, iPKey, tabFlags, nRowLogEst
+Column      zCnName, affinity, szEst, hName, colFlags (COLFLAG_PRIMKEY, _HIDDEN, _VIRTUAL,
+            _STORED, _NOTAVAIL)
+Index       aiColumn[], azColl[], aiRowLogEst[], tnum, onError, idxType, pPartIdxWhere
+Schema      per-database hashes of Table/Index/Trigger/FKey + schema_cookie
+NameContext resolution scope, chained via pNext for correlated subqueries
+Walker      generic tree callback carrier
+Token       { const char *z; unsigned int n; }  — a slice of the SQL text, NOT owned
+With/Cte    common table expressions
+Trigger / TriggerStep    parsed trigger bodies
+Upsert      ON CONFLICT clauses
+AggInfo     aggregate bookkeeping for GROUP BY
+```
+
+## `Expr.op` values you will see constantly
+
+```
+TK_COLUMN     a resolved column: iTable = cursor, iColumn = column index (-1 = rowid)
+TK_AGG_COLUMN a column inside an aggregate query, read from the accumulator
+TK_INTEGER / TK_FLOAT / TK_STRING / TK_BLOB / TK_NULL   literals
+TK_VARIABLE   bound parameter (iColumn = parameter index)
+TK_FUNCTION   x.pList = arguments; u.zToken = name
+TK_AGG_FUNCTION  aggregate call; pAggInfo/iAgg point into AggInfo
+TK_EQ TK_NE TK_LT TK_LE TK_GT TK_GE  comparisons
+TK_AND TK_OR TK_NOT
+TK_IS TK_ISNOT  (NULL-safe comparison)
+TK_IN         x.pList (value list) or x.pSelect (subquery)
+TK_SELECT     scalar subquery
+TK_EXISTS
+TK_BETWEEN TK_CASE TK_CAST TK_COLLATE
+TK_UPLUS/TK_UMINUS/TK_BITNOT
+TK_REGISTER   "value already in VDBE register iTable" — an internal rewrite
+TK_TRUEFALSE  TRUE/FALSE keywords
+TK_IF_NULL_ROW  outer-join NULL-row handling
+TK_SPAN, TK_ID, TK_DOT   pre-resolution forms
+```
+
+## `EP_*` flags worth knowing
+```
+EP_OuterON / EP_InnerON  term originated in a join ON clause (outer/inner)
+EP_Distinct EP_Agg EP_HasFunc EP_FixedCol EP_VarSelect EP_Subquery
+EP_IntValue   u.iValue is valid instead of u.zToken
+EP_Collate    subtree contains an explicit COLLATE
+EP_Reduced / EP_TokenOnly   memory-compressed Expr (used for schema-resident exprs)
+EP_ConstFunc  function is deterministic ⇒ can be factored out of loops
+EP_CanBeNull EP_Win EP_Quoted EP_Leaf EP_Static
+```
+`EP_OuterON` is the one that causes real bugs when mishandled: a WHERE term from a LEFT
+JOIN's ON clause must not be applied before the NULL-row is produced.
+
+## `selFlags` (`SF_*`)
+```
+SF_Distinct SF_All SF_Resolved SF_Aggregate SF_HasAgg SF_UsesEphemeral SF_Expanded
+SF_HasTypeInfo SF_Compound SF_Values SF_MultiValue SF_NestedFrom SF_MinMaxAgg
+SF_Recursive SF_FixedLimit SF_MaybeConvert SF_Converted SF_IncludeHidden
+SF_ComplexResult SF_WhereBegin SF_WinRewrite SF_View SF_NoopOrderBy SF_UFSrcCheck
+SF_PushDown SF_MultiPart SF_CopyCte SF_OrderByReqd SF_UpdateFrom
+```
+Watch `SF_Expanded` → `SF_Resolved` → `SF_Aggregate` appear in `treetrace` output; they mark
+the pipeline stages.
+
+## Resolution order (`lookupName()`)
+```
+1. zDb.zTab.zCol        3-part name
+2. zTab.zCol            2-part (table name or alias)
+3. zCol in any FROM table (ambiguous ⇒ "ambiguous column name")
+4. result-set alias     (ORDER BY / GROUP BY / HAVING only)
+5. outer NameContext    ⇒ mark subquery correlated, nRef++ on the outer context
+6. "no such column: X"
+```
+Special names resolved here too: `rowid`/`oid`/`_rowid_` (→ iColumn = -1, only for rowid
+tables), `sqlite_schema` columns, `NEW`/`OLD` inside triggers, `excluded` inside upserts.
+
+## Affinity rules (`sqlite3AffinityType()`, `build.c`)
+```
+substring "INT"                         → SQLITE_AFF_INTEGER  ('D')
+substring "CHAR"|"CLOB"|"TEXT"          → SQLITE_AFF_TEXT     ('B')
+substring "BLOB" or empty type          → SQLITE_AFF_BLOB     ('A')
+substring "REAL"|"FLOA"|"DOUB"          → SQLITE_AFF_REAL     ('E')
+otherwise                               → SQLITE_AFF_NUMERIC  ('C')
+```
+Checked in that exact order — so `"FLOATING POINT"` is INTEGER.
+
+Comparison affinity (`sqlite3CompareAffinity`):
+- one side INTEGER/REAL/NUMERIC + other side TEXT/BLOB → numeric affinity applied to the
+  text side
+- both TEXT → text comparison
+- BLOB affinity on either side and no other → no conversion
+
+## Collation precedence (`sqlite3ExprCollSeq`)
+```
+1. explicit COLLATE on the left operand (or anywhere in its subtree)
+2. explicit COLLATE on the right operand
+3. the left operand's column collation
+4. the right operand's column collation
+5. BINARY
+```
+
+## Schema bootstrap constants
+```
+SCHEMA_ROOT              1                    (page number of sqlite_schema)
+LEGACY_SCHEMA_TABLE      "sqlite_master"
+DFLT_SCHEMA_TABLE        "sqlite_schema"
+db->init.busy            1 while re-parsing stored CREATE statements
+db->init.newTnum         the root page to install instead of allocating one
+db->init.iDb             which attached database is being initialized
+DB_SchemaLoaded          Schema.schemaFlags bit
+SQLITE_SCHEMA            error returned when a cached statement's schema is stale
+```
+
+## Limits (compile-time, all overridable via `sqlite3_limit()`)
+```
+SQLITE_MAX_LENGTH            1000000000    string/blob byte length
+SQLITE_MAX_SQL_LENGTH        1000000000
+SQLITE_MAX_COLUMN            2000
+SQLITE_MAX_EXPR_DEPTH        1000
+SQLITE_MAX_COMPOUND_SELECT   500
+SQLITE_MAX_VDBE_OP           250000000
+SQLITE_MAX_FUNCTION_ARG      127
+SQLITE_MAX_ATTACHED          10   (max 125)
+SQLITE_MAX_VARIABLE_NUMBER   32766
+SQLITE_MAX_TRIGGER_DEPTH     1000
+BMS (= sizeof(Bitmask)*8)    64   ⇒ effectively 64 tables per join
+```
+
+## Gotchas
+
+1. `Token` does **not** own its text — it points into the SQL string being parsed. Anything
+   that must outlive the parse must be `sqlite3DbStrNDup`'d.
+2. Parse-time allocations use `sqlite3DbMallocRaw(db, ...)` (lookaside) and are freed
+   wholesale on error via Lemon destructors. Never `free()` them manually.
+3. `sqlite3ExprDup()` has three depths: full, `EXPRDUP_REDUCE` (EP_Reduced),
+   and token-only. Schema-resident expressions (CHECK, partial-index WHERE, index
+   expressions) are stored reduced to save memory — which is why some `Expr` fields are
+   invalid there.
+4. A view's `Select` must be duplicated before use; consuming it in place corrupts the
+   schema for the next statement.
+5. `iCursor` numbers are assigned by the code generator (`pParse->nTab++`) and are shared
+   between the plan and the bytecode — the same integer appears in `OP_OpenRead P1`.
+6. Correlated subqueries are detected by `nRef` increments on an *outer* NameContext during
+   resolution. That single counter decides whether the subquery can be cached/flattened.
+7. `sqlite3NestedParse()` supports `%Q` (quoted identifier) and `#N` (VDBE register N) —
+   syntax not available in user SQL.
+8. DDL bumps the schema cookie ⇒ all other connections' prepared statements return
+   `SQLITE_SCHEMA`. `sqlite3_prepare_v2()` transparently re-prepares; the legacy
+   `sqlite3_prepare()` does not.
+9. `ALTER TABLE RENAME` must rewrite the stored SQL of views/triggers/FK constraints —
+   see `alter.c`'s `renameParseSql`/`renameEditSql`. This is why `PRAGMA
+   legacy_alter_table` exists.
+10. Double-quoted strings (DQS) fall back to string literals for compatibility. Disable
+    with `SQLITE_DQS=0` or `sqlite3_db_config(db, SQLITE_DBCONFIG_DQS_DML, 0, 0)`.
+
+## Debug incantations
+```
+sqlite> .treetrace 0xffff        /* or .selecttrace on older builds */
+sqlite> .wheretrace 0xfff
+sqlite> PRAGMA parser_trace=ON;  /* Lemon shift/reduce trace, SQLITE_DEBUG builds */
+sqlite> PRAGMA vdbe_listing=ON;
+```
+In C: `sqlite3TreeTrace = 0xffffffff;` before `sqlite3_prepare_v2()`.

@@ -1,0 +1,101 @@
+# Phase 1 — Assessment
+
+Deliverables in `labs/phase01/`. Pass mark 75/100 — this phase is load-bearing, so do not
+advance on a weak pass.
+
+---
+
+## Task 1 — Header decode by hand (10 pts)
+`header-decode.md` with all 15 header fields of your `mini.db` decoded **from raw hex**,
+each cross-checked against a PRAGMA. Include the reserved-bytes observation for the build
+you used.
+
+*Full marks:* you state what the file would look like if written in WAL mode and what
+changes (bytes 18 and 19 become 2).
+
+---
+
+## Task 2 — Hand-decode three records (15 pts)
+In `record-decode.md`, decode by hand (no program):
+1. a row from a rowid table with a TEXT and an INT column
+2. a row containing `0`, `1`, and a NULL (must show serial types 8 and 9)
+3. an index entry (show the appended rowid)
+
+*Full marks:* byte-offset annotated, like the worked example in `knowledge.md`.
+
+---
+
+## Task 3 — ⭐ `dbparse.c` (30 pts)
+A working parser that:
+- [ ] prints all header fields (5 pts)
+- [ ] walks a b-tree recursively, interior + leaf, table + index (10 pts)
+- [ ] decodes records into typed values including float, blob, and const 0/1 (5 pts)
+- [ ] correctly applies the spill formulas and reports overflow chains (5 pts)
+- [ ] walks the freelist and prints free page numbers (5 pts)
+
+*Stretch (+10 bonus):* accept `-t <table>` and resolve the root page via `sqlite_schema`;
+detect and decode ptrmap pages; print per-page free-space accounting that matches `dbstat`.
+
+Validation: your output for `mini.db`, `big.db`, and a 20k-row table must agree with
+`tool/showdb` and `PRAGMA integrity_check`.
+
+---
+
+## Task 4 — Overflow arithmetic (15 pts)
+In `overflow-math.md`:
+1. Derive X, M, K for U = 4084 (Apple build) and U = 4096 (upstream) for a table leaf.
+2. For payload sizes 100, 4000, 4100, 5000, 100000 compute local bytes and the number of
+   overflow pages.
+3. Verify each prediction against a real database using your parser.
+4. Explain, in your own words, *why* K uses a modulo. What pathological layout does it avoid?
+
+*Full marks:* all five predictions match reality exactly.
+
+---
+
+## Task 5 — Space experiments (15 pts)
+Design and run experiments answering, with numbers, in `space-report.md`:
+1. How many bytes does a `NULL` column cost vs. a `0` vs. a `1` vs. `'x'`?
+2. What is the per-row overhead of a rowid table vs. the same data in a `WITHOUT ROWID`
+   table keyed by a TEXT PK?
+3. How much space does one extra index cost on a 100k-row table? (Use `sqlite3_analyzer`
+   or `dbstat`.)
+4. At what point does a row start overflowing on your build — find the exact row size,
+   experimentally, then confirm with the formula.
+
+---
+
+## Task 6 — Corruption forensics (15 pts)
+`corruption-lab.md` — at least **six** distinct single-byte/field corruptions. For each:
+- what you changed (offset + before/after bytes)
+- what `PRAGMA quick_check` says
+- what `PRAGMA integrity_check` says
+- what a plain `SELECT *` says
+- which C function detected it (find it by grepping for the error path in `btree.c`)
+
+*Full marks:* you find at least one corruption that `quick_check` misses but
+`integrity_check` catches, and explain the difference (quick_check skips the page-usage
+and index-content cross-checks).
+
+---
+
+## Task 7 — Teach-back (bonus 10 pts)
+Write `explain-format-to-a-junior.md`: explain the file format in ≤900 words with your own
+diagrams, without copying this repo's text. If you cannot, you do not know it yet.
+
+---
+
+## Rubric
+| Band | Meaning |
+|---|---|
+| 90–100 | Could implement a read-only SQLite clone; ready for `btree.c` |
+| 75–89 | Solid; format is internalized |
+| 60–74 | Parser works but formulas are fuzzy — redo Tasks 4 & 6 |
+| <60 | Redo Labs 1.3 and 1.5 |
+
+## Exit criteria (hard gate)
+- [ ] You can draw the page layout and header from memory
+- [ ] You can decode a varint and a record by hand in under 3 minutes
+- [ ] `dbparse` walks a multi-level b-tree (build one with 20k rows) without crashing
+- [ ] You can explain the spill formula's `K` term to someone else
+- [ ] MCQ ≥ 20/25

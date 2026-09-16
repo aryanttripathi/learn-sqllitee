@@ -1,0 +1,358 @@
+# Phase 2 — Implementation Labs: Watch ACID Happen
+
+A working, already-verified VFS tracing shim is checked in at
+**`labs/phase02/tracevfs.c`** (built and run on this machine — outputs below are real).
+
+---
+
+## Lab 2.1 — ⭐ Trace every OS call SQLite makes
+
+```sh
+cd ~/Desktop/sqllite/labs/phase02
+cc -Wall -o tracevfs tracevfs.c -lsqlite3      # or link your own amalgamation
+./tracevfs delete       # rollback journal mode
+./tracevfs wal          # WAL mode
+./tracevfs truncate
+./tracevfs persist
+./tracevfs memory
+```
+
+### How the shim works (the pattern for every VFS you will ever write)
+
+```c
+typedef struct TraceFile TraceFile;
+struct TraceFile {
+  sqlite3_file base;     /* MUST be first member: we are a subclass */
+  sqlite3_file *pReal;   /* the wrapped file, allocated right after us */
+  char zName[64];
+};
+
+static int traceOpen(sqlite3_vfs *pVfs, const char *zName, sqlite3_file *pFile,
+                     int flags, int *pOutFlags){
+  TraceFile *p = (TraceFile*)pFile;
+  p->pReal = (sqlite3_file*)&p[1];         /* SQLite allocated szOsFile bytes for us */
+  int rc = g_pRoot->xOpen(g_pRoot, zName, p->pReal, flags, pOutFlags);
+  if( rc==SQLITE_OK ) p->base.pMethods = &trace_io_methods;
+  return rc;
+}
+
+int traceVfsRegister(FILE *log){
+  g_pRoot = sqlite3_vfs_find(0);                            /* the default VFS */
+  trace_vfs.szOsFile = sizeof(TraceFile) + g_pRoot->szOsFile;  /* room for both */
+  trace_vfs.mxPathname = g_pRoot->mxPathname;
+  return sqlite3_vfs_register(&trace_vfs, 0);               /* 0 = not the default */
+}
+```
+
+Three rules for VFS shims, all learned the hard way:
+1. `sqlite3_file base` **must be the first member** — SQLite casts your struct to it.
+2. `szOsFile` must include the wrapped VFS's `szOsFile`; SQLite allocates that much.
+3. Set `iVersion` to what you actually implement. Claiming 3 while leaving `xFetch` NULL
+   is a segfault; claiming 1 disables WAL because `xShmMap` will never be called.
+
+Open with your VFS by name:
+```c
+sqlite3_open_v2("trace.db", &db, SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE, "trace");
+```
+
+### Real output — rollback journal mode, one INSERT
+
+```
+LOCK    trace.db     -> SHARED
+ACCESS  trace.db-journal exists=0        ← hot-journal check
+READ    trace.db     off=24  amt=16      ← change counter + db size
+LOCK    trace.db     -> RESERVED         ← "I intend to write"
+OPEN    trace.db-journal
+WRITE   trace.db-journal off=0     amt=512      ← journal header (padded to sector)
+WRITE   trace.db-journal off=512   amt=4        ← page number
+WRITE   trace.db-journal off=516   amt=4096     ← ORIGINAL page content
+WRITE   trace.db-journal off=4612  amt=4        ← checksum
+LOCK    trace.db     -> EXCLUSIVE
+WRITE   trace.db-journal off=4616  amt=4        ← second page record...
+WRITE   trace.db-journal off=4620  amt=4096
+WRITE   trace.db-journal off=8716  amt=4
+SYNC    trace.db-journal flags=0x2       ←←← barrier 1: originals are safe
+WRITE   trace.db-journal off=0     amt=12       ← now fill in nRec in the header
+SYNC    trace.db-journal flags=0x2       ←←← barrier 2: nRec is safe
+WRITE   trace.db     off=0     amt=4096         ← NOW modify the database
+WRITE   trace.db     off=4096  amt=4096
+SYNC    trace.db     flags=0x2           ←←← barrier 3: new data is durable
+DELETE  trace.db-journal                 ←←← THE COMMIT POINT
+UNLOCK  trace.db     -> SHARED
+UNLOCK  trace.db     -> NONE
+```
+
+**Read that trace ten times.** Every claim in `knowledge.md` §2.3 is visible in it:
+lock escalation, journal-before-db ordering, the two-phase header write (records first,
+then `nRec`), three syncs, and a delete as the commit point.
+
+Answer in `labs/phase02/trace-notes.md`:
+1. Why is `nRec` written to the header *after* the records, with a sync in between?
+2. Why is the journal header 512 bytes when it only has 28 bytes of fields?
+3. Why does the EXCLUSIVE lock appear *before* the last journal writes rather than after?
+4. Which single write, if lost, silently loses the transaction but leaves the db valid?
+
+### Real output — WAL mode
+
+```
+OPEN    trace.db-wal
+SHMMAP  trace.db     pg=0 sz=32768 extend=0     ← the -shm wal-index
+SHMLOCK trace.db     ofst=0 n=1 flags=0xa       ← WAL_WRITE_LOCK  (0xa = shared|lock)
+SHMLOCK trace.db     ofst=1 n=2 flags=0xa       ← CKPT + RECOVER locks
+SHMLOCK trace.db     ofst=4..7  n=1             ← the 5 READ-MARK locks
+WRITE   trace.db-wal off=0  amt=32              ← 32-byte WAL header
+SYNC    trace.db-wal flags=0x3
+```
+
+Note what is **absent** compared to rollback mode: no EXCLUSIVE lock on the db file for a
+plain write transaction, and no writes to `trace.db` at all — only to `-wal`. That is the
+whole point of WAL, and Phase 7 dissects it.
+
+---
+
+## Lab 2.2 — Dissect a live journal file
+
+You need to catch the journal mid-transaction. Use the shell's ability to hold a
+transaction open:
+
+```sh
+cd ~/Desktop/sqllite/labs/phase02
+rm -f j.db*
+sqlite3 j.db 'PRAGMA page_size=4096; CREATE TABLE t(a,b); INSERT INTO t VALUES(1,"x");'
+
+# terminal 1 — hold a write transaction open
+sqlite3 j.db
+sqlite> BEGIN IMMEDIATE;
+sqlite> UPDATE t SET b='yyyy';
+-- leave it sitting here
+
+# terminal 2
+ls -l j.db*
+xxd -l 64 j.db-journal
+```
+
+Expected header:
+```
+00000000: d9d5 05f9 20a1 63d7 ffff ffff <nonce>  ← magic, nRec=unknown(-1), cksumInit
+00000010: 0000 0002 0000 0200 0000 1000 ...      ← dbSize=2, sector=512, pagesz=4096
+```
+
+Decode all six fields into `labs/phase02/journal-decode.md`. Then in terminal 1 type
+`COMMIT;` and watch the journal vanish.
+
+Useful tool build:
+```sh
+cd ~/Desktop/sqllite/sqlite-src && cc -o /tmp/showjournal tool/showjournal.c
+/tmp/showjournal ~/Desktop/sqllite/labs/phase02/j.db-journal
+```
+
+---
+
+## Lab 2.3 — Locking observed from two processes
+
+Terminal 1:
+```sh
+sqlite3 j.db
+sqlite> BEGIN IMMEDIATE;      -- takes RESERVED right away
+sqlite> INSERT INTO t VALUES(9,'nine');
+```
+
+Terminal 2:
+```sh
+sqlite3 j.db 'SELECT count(*) FROM t;'        # works — readers not blocked yet
+sqlite3 j.db 'INSERT INTO t VALUES(8,"eight");'   # Error: database is locked
+sqlite3 j.db '.timeout 5000' 'INSERT INTO t VALUES(8,"eight");'  # waits, then fails
+```
+
+Now go back to terminal 1 and `COMMIT;`, then rerun terminal 2.
+
+Next, see the `PENDING` effect: in terminal 1 run a `BEGIN; ... COMMIT;` on a large table
+while terminal 2 loops `SELECT`s, and observe that terminal 2 gets `SQLITE_BUSY` on *new*
+reads while terminal 1 is committing.
+
+Also see the locks with a system tool:
+```sh
+lsof j.db                 # macOS/Linux: shows fds
+# macOS does not show byte-range advisory locks well; on Linux use:
+# cat /proc/locks | grep $(stat -c %i j.db)
+```
+
+Write `labs/phase02/locking-notes.md`: for each of BEGIN, BEGIN IMMEDIATE, BEGIN EXCLUSIVE,
+state which lock is taken and when, and at which moment a second connection starts failing.
+
+---
+
+## Lab 2.4 — `BEGIN` vs `BEGIN IMMEDIATE` and the upgrade deadlock
+
+```sh
+# A classic production bug, reproduced in 6 lines:
+# T1: BEGIN;  SELECT ...            (SHARED)
+# T2: BEGIN;  SELECT ...            (SHARED)
+# T1: UPDATE ...                    (RESERVED — ok)
+# T2: UPDATE ...                    → SQLITE_BUSY, and retrying NEVER helps
+```
+
+Reproduce it with two shells. Then fix it by using `BEGIN IMMEDIATE` in both, and explain
+in `labs/phase02/busy-notes.md` why the deferred version cannot be rescued by
+`busy_timeout` (the busy handler is not invoked when the connection would have to abandon
+its own read snapshot — SQLite returns `SQLITE_BUSY` immediately to avoid deadlock).
+
+---
+
+## Lab 2.5 — Page cache behaviour
+
+```sh
+sqlite3 cache.db <<'SQL'
+PRAGMA page_size=4096;
+CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<200000)
+INSERT INTO t SELECT i, randomblob(50) FROM c;
+SQL
+
+for cs in 10 100 2000 20000; do
+  echo "cache_size=$cs"
+  time sqlite3 cache.db "PRAGMA cache_size=$cs; SELECT count(*) FROM t WHERE b LIKE '%ff%';"
+done
+```
+
+Then watch cache spill during a big transaction with the trace VFS: instrument
+`tracevfs.c`'s `main()` to run a 100k-row insert inside one transaction with
+`PRAGMA cache_size=50`, and count how many `WRITE trace.db` lines appear **before** the
+commit. Those are spills — the transaction is writing to the database file before the
+commit point, which is exactly why the journal must already be synced.
+
+```sh
+sqlite3 cache.db 'PRAGMA cache_spill;' 'PRAGMA cache_size;'
+```
+
+Record numbers in `labs/phase02/cache-report.md`.
+
+---
+
+## Lab 2.6 — Crash testing: break durability deliberately
+
+Write `crashtest.c` — a program that inserts rows in a loop and is killed at a random
+moment — then check whether the database is consistent afterwards.
+
+```sh
+cat > crash_loop.sh <<'SH'
+#!/bin/sh
+# usage: ./crash_loop.sh <journal_mode> <synchronous> <iterations>
+MODE=${1:-delete}; SYNC=${2:-full}; N=${3:-30}
+for i in $(seq 1 $N); do
+  rm -f c.db c.db-journal c.db-wal c.db-shm
+  sqlite3 c.db "PRAGMA journal_mode=$MODE; PRAGMA synchronous=$SYNC;
+                CREATE TABLE t(a INTEGER PRIMARY KEY, b);" >/dev/null
+  ( sqlite3 c.db "PRAGMA journal_mode=$MODE; PRAGMA synchronous=$SYNC;
+      BEGIN; WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<50000)
+      INSERT INTO t SELECT i, randomblob(80) FROM c; COMMIT;" >/dev/null 2>&1 ) &
+  PID=$!
+  # kill at a random point during the transaction
+  perl -e 'select(undef,undef,undef,0.05+rand(0.4))'
+  kill -9 $PID 2>/dev/null
+  wait $PID 2>/dev/null
+  RES=$(sqlite3 c.db 'PRAGMA integrity_check;' 2>&1 | head -1)
+  CNT=$(sqlite3 c.db 'SELECT count(*) FROM t;' 2>&1 | head -1)
+  echo "run $i: integrity=$RES rows=$CNT"
+done
+SH
+chmod +x crash_loop.sh
+./crash_loop.sh delete full 20
+./crash_loop.sh memory full 20      # journal_mode=MEMORY — expect trouble
+./crash_loop.sh off    off  20      # expect corruption
+```
+
+`kill -9` simulates a *process* crash, not a *power* crash (the page cache in the kernel
+survives). So `journal_mode=OFF` may still look fine here — note that, and explain the
+difference in `labs/phase02/crash-report.md`. Real power-loss testing needs the
+crash-simulation VFS in the SQLite test suite:
+
+```sh
+cd ~/Desktop/sqllite/sqlite-src/build
+./testfixture ../test/crash.test
+./testfixture ../test/crash8.test
+./testfixture ../test/atomic2.test
+```
+
+Read `test/crash.test` and `src/test6.c` — the latter is a VFS that simulates torn sector
+writes and reordered I/O. This is how SQLite actually proves durability.
+
+---
+
+## Lab 2.7 — Build a real, useful VFS: `xorvfs`
+
+Extend `tracevfs.c` into an obfuscating VFS: XOR every page with a key on write and on
+read. (Not real encryption — the point is the mechanics of transforming data in the VFS.)
+
+Rules you must handle:
+- Page 1's first 16 bytes must stay the magic string if you want other tools to open it;
+  decide whether to exempt them and document the tradeoff.
+- The journal contains page images too — transform them consistently.
+- `xRead` may be called with `iAmt=100` (the header) or `iAmt=pagesize`; your transform
+  must be position-based, not buffer-based.
+
+```sh
+cc -Wall -o xorvfs xorvfs.c -lsqlite3
+./xorvfs                       # writes xor.db
+sqlite3 xor.db 'SELECT * FROM t;'    # should fail: "file is not a database"
+./xorvfs read                  # your VFS reads it back fine
+```
+
+Deliverable: `labs/phase02/xorvfs.c` + notes on which methods needed changes.
+
+---
+
+## Lab 2.8 — Read the pager source with a debugger
+
+```sh
+lldb ~/Desktop/sqllite/sqlite-src/build/sqlite3
+(lldb) b pager_write_pagelist
+(lldb) b pagerAddPageToRollbackJournal        # name varies by version; try:
+(lldb) b write32bits
+(lldb) b sqlite3PagerCommitPhaseOne
+(lldb) b sqlite3PagerCommitPhaseTwo
+(lldb) run test.db
+sqlite> CREATE TABLE x(a); INSERT INTO x VALUES(1);
+```
+
+At each stop, print the pager state:
+```
+(lldb) p pPager->eState        # 0 OPEN,1 READER,2 WRITER_LOCKED,3 CACHEMOD,4 DBMOD,5 FINISHED
+(lldb) p pPager->eLock         # 0 NONE,1 SHARED,2 RESERVED,3 PENDING,4 EXCLUSIVE
+(lldb) p pPager->journalMode
+(lldb) p pPager->dbSize
+```
+
+Deliverable: `labs/phase02/pager-states.md` — a table of (breakpoint, eState, eLock) showing
+the state machine walking from READER to FINISHED and back.
+
+---
+
+## Lab 2.9 — Measure the cost of durability
+
+```sh
+for s in off normal full extra; do
+  rm -f perf.db*
+  sqlite3 perf.db "PRAGMA journal_mode=delete; PRAGMA synchronous=$s; CREATE TABLE t(a);" >/dev/null
+  echo -n "synchronous=$s  "
+  /usr/bin/time -p sqlite3 perf.db \
+    "PRAGMA synchronous=$s;
+     BEGIN; $(for i in $(seq 1 200); do echo \"INSERT INTO t VALUES($i);\"; done) COMMIT;" 2>&1 | grep real
+done
+```
+
+Then the dramatic version — 1000 *separate* transactions:
+```sh
+for s in off full; do
+  rm -f perf2.db*
+  sqlite3 perf2.db "PRAGMA synchronous=$s; CREATE TABLE t(a);" >/dev/null
+  echo -n "1000 txns, synchronous=$s  "
+  /usr/bin/time -p sh -c "for i in \$(seq 1 1000); do
+      sqlite3 perf2.db \"PRAGMA synchronous=$s; INSERT INTO t VALUES(\$i);\" ; done" 2>&1 | grep real
+done
+```
+
+You should see one to three orders of magnitude. Write the numbers and the explanation
+(one fsync per transaction ≈ one disk rotation / flash program time) in
+`labs/phase02/durability-cost.md`. This is the single most useful performance fact about
+SQLite for application developers.
