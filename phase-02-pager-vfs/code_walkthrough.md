@@ -1,0 +1,279 @@
+# Phase 2 — Code Walkthrough: The Pager
+
+Source:
+[`src/pager.c`](https://github.com/sqlite/sqlite/blob/master/src/pager.c) ·
+[`src/os_unix.c`](https://github.com/sqlite/sqlite/blob/master/src/os_unix.c) ·
+[`src/pcache1.c`](https://github.com/sqlite/sqlite/blob/master/src/pcache1.c) ·
+spec: [atomiccommit.html](https://sqlite.org/atomiccommit.html)
+
+---
+
+## Mental model for this phase
+
+> **`pager.c` is a state machine whose transitions are I/O, and whose invariant is:
+> "the original of any page I am about to modify is already durable somewhere else."**
+
+Read every pager function by asking: *which state does this move me into, and what must be
+on disk before it may?* The state variable is literally `pPager->eState`, and there is an
+`assert_pager_state()` function that encodes the whole legal transition table — read that
+function once and you have the specification.
+
+**Before reading any of `pager.c`, read its header comment.** It is a multi-page design
+document, and it is the best-written prose in the codebase:
+
+```sh
+# in the source tree:
+head -250 src/pager.c
+```
+
+---
+
+## 1. `sqlite3PagerWrite()` — the four-way fork
+
+This is the function the b-tree calls before touching any page. Real code:
+
+```c
+SQLITE_PRIVATE int sqlite3PagerWrite(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+  assert( (pPg->flags & PGHDR_MMAP)==0 );
+  assert( pPager->eState>=PAGER_WRITER_LOCKED );
+  assert( assert_pager_state(pPager) );
+  if( (pPg->flags & PGHDR_WRITEABLE)!=0 && pPager->dbSize>=pPg->pgno ){
+    if( pPager->nSavepoint ) return subjournalPageIfRequired(pPg);
+    return SQLITE_OK;
+  }else if( pPager->errCode ){
+    return pPager->errCode;
+  }else if( pPager->sectorSize > (u32)pPager->pageSize ){
+    assert( pPager->tempFile==0 );
+    return pagerWriteLargeSector(pPg);
+  }else{
+    return pager_write(pPg);
+  }
+}
+```
+
+| Branch | Meaning |
+|---|---|
+| `assert( pPager->eState>=PAGER_WRITER_LOCKED )` | **the contract:** you cannot write outside a write transaction. This one assert is the ACID entry gate. |
+| `PGHDR_WRITEABLE` already set | the page's original is already journalled — nothing to do. This is the common case in a loop that touches the same page repeatedly (e.g. inserting 50 rows into one leaf). The whole function exists to make that case cost one branch. |
+| `if( pPager->nSavepoint ) return subjournalPageIfRequired(pPg);` | ...except that an open **savepoint** may still need this page recorded in the *sub*-journal, even though the main journal already has it. Savepoints are a second, independent undo log. |
+| `pPager->errCode` | once the pager has failed, every subsequent operation returns the same error. Sticky errors prevent a half-broken pager from being used. |
+| `pPager->sectorSize > pageSize` | **the torn-write defence.** If the device's atomic sector is larger than a page, modifying one page can damage its neighbours in the same sector, so `pagerWriteLargeSector()` journals *every* page in that sector. This is why `xSectorSize` exists in the VFS. |
+| `pager_write(pPg)` | the normal path. |
+
+---
+
+## 2. `pager_write()` — journal-before-modify, in order
+
+The real ordering logic, trimmed to the load-bearing lines:
+
+```c
+static int pager_write(PgHdr *pPg){
+  Pager *pPager = pPg->pPager;
+
+  assert( pPager->eState==PAGER_WRITER_LOCKED
+       || pPager->eState==PAGER_WRITER_CACHEMOD
+       || pPager->eState==PAGER_WRITER_DBMOD );
+
+  /* The journal file needs to be opened. ...
+  ** This is done before calling sqlite3PcacheMakeDirty() on the page.
+  ** Otherwise, if it were done after ..., then an error might occur and the
+  ** pager would end up in WRITER_LOCKED state with pages marked as dirty. */
+  if( pPager->eState==PAGER_WRITER_LOCKED ){
+    rc = pager_open_journal(pPager);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+
+  /* Mark the page that is about to be modified as dirty. */
+  sqlite3PcacheMakeDirty(pPg);
+
+  if( pPager->pInJournal!=0
+   && sqlite3BitvecTestNotNull(pPager->pInJournal, pPg->pgno)==0
+  ){
+    assert( pagerUseWal(pPager)==0 );
+    if( pPg->pgno<=pPager->dbOrigSize ){
+      rc = pagerAddPageToRollbackJournal(pPg);
+      if( rc!=SQLITE_OK ) return rc;
+    }else{
+      if( pPager->eState!=PAGER_WRITER_DBMOD ){
+        pPg->flags |= PGHDR_NEED_SYNC;
+      }
+    }
+  }
+
+  /* The PGHDR_DIRTY bit is set above ... Wait until now, after the page has
+  ** been successfully journalled, before setting the PGHDR_WRITEABLE bit */
+  pPg->flags |= PGHDR_WRITEABLE;
+  ...
+}
+```
+
+The five decisions, in order:
+
+1. **Open the journal lazily** (`WRITER_LOCKED → WRITER_CACHEMOD`). A transaction that
+   never modifies anything never creates a journal file. The comment explains *why* this
+   must happen before marking the page dirty — an error afterwards would leave dirty pages
+   with no journal, an unrecoverable state. **This is a real bug that the ordering
+   prevents**, and the comment says so.
+
+2. `sqlite3PcacheMakeDirty(pPg)` — move the page onto the dirty list so a later flush or
+   cache spill knows to write it.
+
+3. `sqlite3BitvecTestNotNull(pPager->pInJournal, pPg->pgno)` — *have I already saved this
+   page's original?* `pInJournal` is a `Bitvec`: one bit per page number, O(1), and sparse
+   in memory. Without it, every write would rescan the journal.
+
+4. `if( pPg->pgno<=pPager->dbOrigSize )` — **the elegant part.** A page beyond the
+   database's original size did not exist when the transaction started, so there is nothing
+   to restore. Rollback just truncates the file. Journalling those pages would be pure
+   waste — which is why appending rows is so much cheaper than updating them.
+
+5. `pPg->flags |= PGHDR_NEED_SYNC;` for those new pages, and `PGHDR_WRITEABLE` **only
+   after** journalling succeeded. `PGHDR_NEED_SYNC` means "the journal record protecting
+   this page is not yet on disk, so this page must not be written to the database file."
+   The durability ordering rule from `knowledge.md` §2.3, encoded as one bit per page.
+
+**Take-away:** the entire atomic-commit argument is implemented as bit flags on cache
+entries plus one `Bitvec`. There is no transaction manager object.
+
+---
+
+## 3. `hasHotJournal()` — four conditions, and an honest race
+
+Recovery correctness depends on this predicate. Real code, trimmed:
+
+```c
+static int hasHotJournal(Pager *pPager, int *pExists){
+  ...
+  *pExists = 0;
+  if( !jrnlOpen ){
+    rc = sqlite3OsAccess(pVfs, pPager->zJournal, SQLITE_ACCESS_EXISTS, &exists);
+  }
+  if( rc==SQLITE_OK && exists ){
+    int locked = 0;
+
+    /* Race condition here:  Another process might have been holding the
+    ** the RESERVED lock and have a journal open at the sqlite3OsAccess()
+    ** call above, but then delete the journal and drop the lock before
+    ** we get to the following sqlite3OsCheckReservedLock() call.  If that
+    ** is the case, this routine might think there is a hot journal when
+    ** in fact there is none.  This results in a false-positive which will
+    ** be dealt with by the playback routine.  Ticket #3883. */
+    rc = sqlite3OsCheckReservedLock(pPager->fd, &locked);
+    if( rc==SQLITE_OK && !locked ){
+      rc = pagerPagecount(pPager, &nPage);
+      if( rc==SQLITE_OK ){
+        if( nPage==0 && !jrnlOpen ){
+          /* zero-page database: the journal is a leftover; delete it */
+        }else{
+          /* ... check that there is at least one non-zero byte at the start
+          ** of the journal file.  If there is, then we consider this journal
+          ** to be hot. If not, it can be ignored. */
+          rc = sqlite3OsRead(pPager->jfd, (void *)&first, 1, 0);
+          if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
+          *pExists = (first!=0);
+        }
+      }
+    }
+  }
+  return rc;
+}
+```
+
+Reading notes:
+
+- The four conditions from `knowledge.md` §2.5 appear literally: journal **exists**, nobody
+  holds **RESERVED**, the database is **non-empty**, and the journal's **first byte is
+  non-zero**.
+- `*pExists = (first!=0)` is how `journal_mode=PERSIST` signals commit: instead of deleting
+  the file, the commit zeroes the magic. A zeroed header means "not hot".
+- `SQLITE_IOERR_SHORT_READ` is converted to `SQLITE_OK` with `first` left 0 — a truncated
+  journal is not hot.
+- **The race-condition comment is the thing to study.** The code is knowingly racy, and the
+  resolution is not a lock but an argument: a false positive costs a harmless replay, and
+  a false negative is impossible. Systems code that documents its own races, and why they
+  are safe, is what good systems code looks like. `Ticket #3883` is a real entry in the
+  [Fossil timeline](https://sqlite.org/src/timeline) — you can read the original bug.
+- `sqlite3BeginBenignMalloc()` around the cleanup: an OOM during an *optimization* must not
+  fail the operation. SQLite marks such regions so the OOM simulator ignores them.
+
+---
+
+## 4. Read the state machine, not the functions
+
+The single most valuable thing in `pager.c` is `assert_pager_state()`. It is only compiled
+in debug builds, and it states every legal combination of state, lock, and journal:
+
+```sh
+A=~/Desktop/sqllite/sqlite-amalgamation-3500400
+sed -n '/^static int assert_pager_state(Pager \*p){/,/^}/p' $A/sqlite3.c
+```
+
+Excerpts you will find (paraphrased by state):
+```
+PAGER_READER          ⇒ eLock >= SHARED_LOCK, no journal open (unless PERSIST)
+PAGER_WRITER_LOCKED   ⇒ eLock >= RESERVED_LOCK, dbSize == dbOrigSize
+PAGER_WRITER_CACHEMOD ⇒ journal is open (or journal_mode is OFF/MEMORY/WAL)
+PAGER_WRITER_DBMOD    ⇒ eLock == EXCLUSIVE_LOCK
+PAGER_ERROR           ⇒ errCode != SQLITE_OK
+```
+
+Reading that one function teaches you more about the pager than reading three of its
+algorithms.
+
+---
+
+## 5. Large functions — mechanism only
+
+| Function | Size | What it does, and what to check when you need it |
+|---|---|---|
+| [`pager_playback()`](https://github.com/sqlite/sqlite/blob/master/src/pager.c) | ~200 lines | Rollback/recovery. Reads the journal header for `nRec`, `cksumInit`, `dbSize`; loops `pager_playback_one_page()`; truncates the database to `dbSize`; syncs; finalizes the journal. Key subtlety: `nRec==0xffffffff` means "compute the count from the file size", and a checksum failure **stops** playback rather than failing it. |
+| `pager_write_pagelist()` | ~120 lines | Writes the dirty list to the database file. Skips pages with `PGHDR_NEED_SYNC` unset ordering violations, grows the file with `SQLITE_FCNTL_SIZE_HINT`, and handles the change-counter page specially (`pager_write_changecounter`). |
+| `sqlite3PagerCommitPhaseOne()` | ~150 lines | The barrier sequence: sync the journal, write the change counter, write dirty pages, sync the database. In WAL mode it instead calls `sqlite3WalFrames()`. Read the `if( pagerUseWal(pPager) )` split first — it shows exactly where the two durability engines diverge. |
+| `pagerStress()` | ~90 lines | The page-cache spill callback. It is *called by pcache1* when memory is tight, and it must journal + write a dirty page mid-transaction. Read it to understand why a big transaction with a small cache takes an EXCLUSIVE lock early. |
+| [`unixLock()`](https://github.com/sqlite/sqlite/blob/master/src/os_unix.c) | ~150 lines | The five-state lock transition on the byte range at `PENDING_BYTE`. Most of its length is the `unixInodeInfo` bookkeeping that works around POSIX's "closing any fd drops all locks" defect. |
+
+---
+
+## 6. `Bitvec` — 400 lines worth reading in full
+
+`pInJournal` is a `Bitvec`, and it is the nicest self-contained data structure in SQLite:
+
+```sh
+grep -n "^struct Bitvec\|^SQLITE_PRIVATE int sqlite3BitvecSet\|^SQLITE_PRIVATE int sqlite3BitvecTest" $A/sqlite3.c
+```
+
+The design: for small page counts it is a plain bit array; above a threshold it becomes a
+hash table; above that, a tree of sub-Bitvecs. All three representations live in one
+fixed-size struct with a union, so a `Bitvec` never grows a large allocation for a sparse
+set. That matters because a transaction touching page 900,000 of a 1M-page database must
+not allocate 125 KB just to remember one bit.
+
+This is also the structure `PagerSavepoint.pInSavepoint` uses — the same trick, once per
+savepoint.
+
+---
+
+## 7. Exercises against real source
+
+Answer in `labs/phase02/source-questions.md` with `src/file.c` + function citations:
+
+1. In `pager_write()`, what exactly goes wrong if `sqlite3PcacheMakeDirty()` is moved
+   *before* `pager_open_journal()`? Quote the comment and explain the failure mode.
+2. Find `pagerWriteLargeSector()`. How many pages does it journal, and how does it find
+   them? Which VFS method drives this?
+3. Find `pager_playback_one_page()`. What does it do when the checksum fails, and why is
+   that safe rather than a data-loss bug?
+4. In `hasHotJournal()`, why is `sqlite3BeginBenignMalloc()` used around the
+   delete-the-journal path?
+5. Find `pager_end_transaction()` and list the four journal-mode-specific finalization
+   paths (DELETE / TRUNCATE / PERSIST / WAL).
+6. Find where `PGHDR_NEED_SYNC` is *cleared*. What must have happened first?
+7. In `os_unix.c`, find `unixInodeInfo` and `pUnused`. Write three sentences explaining the
+   POSIX defect they work around.
+
+```sh
+sed -n '/^static int pagerWriteLargeSector(/,/^}/p' $A/sqlite3.c
+grep -n "PGHDR_NEED_SYNC" $A/sqlite3.c | head -20
+sed -n '/^static int pager_end_transaction(/,/^}/p' $A/sqlite3.c | head -80
+```

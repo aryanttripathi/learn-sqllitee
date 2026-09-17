@@ -178,7 +178,9 @@ PRAGMA case_sensitive_like=ON;              -- affects LIKE→range optimization
    wrong answers, not slow ones.
 9. `AUTOMATIC COVERING INDEX` in a plan means SQLite built an index at runtime because you
    didn't — usually a 100× speedup is available by creating it permanently.
-10. The solver is heuristic (`mxChoice` ≤ 10). With many tables it can miss the optimum;
+10. The solver is heuristic. `mxChoice` (paths kept per round) is 1 for a single loop,
+    5 for two, and 12 or 18 for three or more — see the TUNING comment above
+    `wherePathSolver()`. With many tables it can miss the optimum;
     that is a documented trade-off, not a bug.
 11. Cost estimates assume uniform distribution *within* an index prefix even with STAT4
     outside the sampled values.

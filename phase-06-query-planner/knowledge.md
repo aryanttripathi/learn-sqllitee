@@ -222,7 +222,8 @@ Choosing a join order is `O(n!)` if done naively. SQLite uses **"N nearest neigh
 dynamic programming:
 
 ```
-  Let mxChoice = (nLoop<=1) ? 1 : (nLoop==2 ? 5 : 10)
+  Let mxChoice = (nLoop<=1) ? 1 : (nLoop==2 ? 5 : computeMxChoice(pWInfo))
+  /* TUNING comment in where.c:  nLoop 1 -> 1,  nLoop 2 -> 5,  nLoop 3+ -> 12 or 18 */
 
   paths = [ empty path ]
   repeat nLoop times:

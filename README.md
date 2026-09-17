@@ -8,10 +8,15 @@ Everything here is organized as **phases**. Each phase directory contains five d
 | File | Purpose |
 |---|---|
 | `knowledge.md` | The concepts, with diagrams. Read first. |
+| `code_walkthrough.md` | **Real SQLite C, annotated line by line**, plus the mental model for reading that layer. Large functions are explained by mechanism with a source link. |
 | `implementation.md` | Hands-on labs. Real C, real hexdumps, real experiments. |
 | `internals_important.md` | The dense reference: files, structs, functions, invariants, gotchas. |
-| `mcq.md` | ~20 multiple-choice questions with explained answers. |
+| `mcq.md` | ~25 multiple-choice questions with explained answers. |
 | `assessment.md` | Build-something tasks + rubric. You are not done until these pass. |
+
+Start with **[`READING-THE-CODE.md`](READING-THE-CODE.md)** — the three-pass method, naming
+conventions, what to skip, and how to trace a query through all six layers. Every
+`code_walkthrough.md` applies that method to one layer.
 
 ---
 
@@ -128,11 +133,13 @@ Useful flags to compile with while learning:
 
 ## How to study (do not skip this)
 
+0. Read `READING-THE-CODE.md` once, before Phase 0.
 1. Read `knowledge.md` once, fast. Don't chase every detail.
-2. Do every lab in `implementation.md`. **Typing the hexdump out by hand is the point.**
-3. Keep `internals_important.md` open while reading real source.
-4. Take `mcq.md` cold. Below 80% ⇒ reread.
-5. Ship `assessment.md`. Put your artifacts in `labs/phaseNN/`.
+2. Read `code_walkthrough.md` with the source open in another window.
+3. Do every lab in `implementation.md`. **Typing the hexdump out by hand is the point.**
+4. Keep `internals_important.md` open while reading real source.
+5. Take `mcq.md` cold. Below 80% ⇒ reread.
+6. Ship `assessment.md`. Put your artifacts in `labs/phaseNN/`.
 
 A rule that will save you months: **when confused, dump bytes.** SQLite has no hidden state.
 Everything is in the file, the WAL, or the bytecode — and all three are printable.
@@ -148,17 +155,17 @@ The SQLite amalgamation (3.50.4) is already unpacked at `sqlite-amalgamation-350
 
 ## Progress tracker
 
-| Phase | knowledge | implementation | internals | mcq | assessment | done |
-|---|---|---|---|---|---|---|
-| 0 Foundations | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 1 File format | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 2 Pager & VFS | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 3 B-tree | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 4 Front end | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 5 VDBE | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 6 Planner | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 7 Transactions & WAL | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
-| 8 Extensions & testing | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| Phase | knowledge | walkthrough | implementation | internals | mcq | assessment | done |
+|---|---|---|---|---|---|---|---|
+| 0 Foundations | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 1 File format | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 2 Pager & VFS | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 3 B-tree | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 4 Front end | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 5 VDBE | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 6 Planner | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 7 Transactions & WAL | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
+| 8 Extensions & testing | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 
 ## The five hardest things in this course (in order)
 

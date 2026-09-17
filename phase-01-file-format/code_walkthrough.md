@@ -1,0 +1,381 @@
+# Phase 1 — Code Walkthrough: The Format, in C
+
+Every byte you decoded by hand in `knowledge.md` is produced and consumed by four small
+functions. This document reads all four line by line, from the real source.
+
+Source:
+[`src/btree.c`](https://github.com/sqlite/sqlite/blob/master/src/btree.c) ·
+[`src/util.c`](https://github.com/sqlite/sqlite/blob/master/src/util.c) ·
+[`src/vdbemem.c`](https://github.com/sqlite/sqlite/blob/master/src/vdbemem.c) ·
+spec: [fileformat2.html](https://sqlite.org/fileformat2.html)
+
+---
+
+## Mental model for this phase
+
+> **The file format has exactly two encodings — varints and serial types — and exactly one
+> layout idea: the slotted page.** Every function here is a small, hand-optimized
+> encoder/decoder for one of those three things. There is no cleverness beyond speed.
+
+When reading format code, hold this question: *is this line computing a size, an offset, or
+a value?* Almost every line does one of the three.
+
+---
+
+## 1. `sqlite3GetVarint32()` — why a "simple" varint is 30 lines
+
+Real code, `src/util.c`:
+
+```c
+SQLITE_PRIVATE u8 sqlite3GetVarint32(const unsigned char *p, u32 *v){
+  u64 v64;
+  u8 n;
+
+  /* Assume that the single-byte case has already been handled by
+  ** the getVarint32() macro */
+  assert( (p[0] & 0x80)!=0 );
+
+  if( (p[1] & 0x80)==0 ){
+    /* This is the two-byte case */
+    *v = ((p[0]&0x7f)<<7) | p[1];
+    return 2;
+  }
+  if( (p[2] & 0x80)==0 ){
+    /* This is the three-byte case */
+    *v = ((p[0]&0x7f)<<14) | ((p[1]&0x7f)<<7) | p[2];
+    return 3;
+  }
+  /* four or more bytes */
+  n = sqlite3GetVarint(p, &v64);
+  assert( n>3 && n<=9 );
+  if( (v64 & SQLITE_MAX_U32)!=v64 ){
+    *v = 0xffffffff;
+  }else{
+    *v = (u32)v64;
+  }
+  return n;
+}
+```
+
+| Line | Reading |
+|---|---|
+| `assert( (p[0] & 0x80)!=0 );` | **Read this as the contract:** the caller has already handled the 1-byte case. The `getVarint32()` *macro* tests `p[0]<0x80` inline and only calls this function otherwise. So the hottest case never even makes a function call. |
+| `if( (p[1] & 0x80)==0 )` | 2-byte case, unrolled by hand. Seven bits from each byte: `(p[0]&0x7f)<<7 | p[1]`. |
+| 3-byte case | unrolled again. Beyond this, the distribution of real payload sizes makes further unrolling not worth the code size. |
+| `n = sqlite3GetVarint(p, &v64);` | fall back to the general 64-bit loop for 4–9 bytes. |
+| `if( (v64 & SQLITE_MAX_U32)!=v64 ) *v = 0xffffffff;` | **saturate instead of truncate.** A corrupt file can encode a huge value where a 32-bit size is expected; clamping to `0xffffffff` guarantees every downstream size check *fails* rather than wrapping to a small number and passing. This one line is an entire class of exploit, closed. |
+
+**The lesson of this function:** in the format layer, the fast path is hand-unrolled and the
+slow path is where the safety lives.
+
+Related, two lines below in the same file:
+```c
+SQLITE_PRIVATE int sqlite3VarintLen(u64 v){
+  int i;
+  for(i=1; (v >>= 7)!=0; i++){ assert( i<10 ); }
+  return i;
+}
+```
+"How many bytes will this varint need?" — needed *before* encoding, because record headers
+must know their own size. That chicken-and-egg problem shows up again in `OP_MakeRecord`
+(Phase 5).
+
+---
+
+## 2. `zeroPage()` — the page header, written in 12 lines
+
+This is the shortest complete statement of the b-tree page format in the codebase.
+Real code, `src/btree.c`:
+
+```c
+static void zeroPage(MemPage *pPage, int flags){
+  unsigned char *data = pPage->aData;
+  BtShared *pBt = pPage->pBt;
+  int hdr = pPage->hdrOffset;
+  int first;
+
+  /* ... asserts ... */
+  if( pBt->btsFlags & BTS_FAST_SECURE ){
+    memset(&data[hdr], 0, pBt->usableSize - hdr);
+  }
+  data[hdr] = (char)flags;
+  first = hdr + ((flags&PTF_LEAF)==0 ? 12 : 8);
+  memset(&data[hdr+1], 0, 4);
+  data[hdr+7] = 0;
+  put2byte(&data[hdr+5], pBt->usableSize);
+  pPage->nFree = (u16)(pBt->usableSize - first);
+  decodeFlags(pPage, flags);
+  pPage->cellOffset = (u16)first;
+  pPage->aDataEnd = &data[pBt->pageSize];
+  pPage->aCellIdx = &data[first];
+  pPage->aDataOfst = &data[pPage->childPtrSize];
+  pPage->nOverflow = 0;
+  pPage->maskPage = (u16)(pBt->pageSize - 1);
+  pPage->nCell = 0;
+  pPage->isInit = 1;
+}
+```
+
+Match each line to the header table from `knowledge.md` §1.3:
+
+| Code | Format field |
+|---|---|
+| `int hdr = pPage->hdrOffset;` | **100 for page 1, 0 for all others.** The database header sits in front of page 1's b-tree header; this single variable absorbs that special case everywhere in `btree.c`. |
+| `if( pBt->btsFlags & BTS_FAST_SECURE ) memset(...)` | `PRAGMA secure_delete` — zero the whole page so old row bytes are not readable in the file (your Phase 1 Lab 1.8). |
+| `data[hdr] = (char)flags;` | byte 0: the page type (0x02/0x05/0x0a/0x0d). |
+| `first = hdr + ((flags&PTF_LEAF)==0 ? 12 : 8);` | **8-byte header for leaves, 12 for interior** (the extra 4 = right-most child pointer). `first` is where the cell pointer array starts. |
+| `memset(&data[hdr+1], 0, 4);` | bytes 1–2 (first freeblock = none) and bytes 3–4 (nCell = 0) in one store. |
+| `data[hdr+7] = 0;` | byte 7: fragmented free bytes. |
+| `put2byte(&data[hdr+5], pBt->usableSize);` | bytes 5–6: cell content area starts at the *end* of the usable page — the page is empty, so content grows down from there. |
+| `pPage->nFree = usableSize - first;` | free space = everything between the header and the end. |
+| `pPage->aCellIdx = &data[first];` | cached pointer to the cell pointer array — used by every cell access afterwards. |
+| `pPage->maskPage = pageSize - 1;` | since page size is a power of two, `offset & maskPage` converts a pointer into a within-page offset with no division. |
+
+Note what is **in memory only**: `nFree`, `cellOffset`, `aCellIdx`, `maskPage`, `isInit`.
+The file gets 8 or 12 bytes; the `MemPage` gets a dozen derived fields so the hot paths
+never recompute them.
+
+---
+
+## 3. `decodeFlags()` — how one byte selects the page's whole behaviour
+
+```c
+static int decodeFlags(MemPage *pPage, int flagByte){
+  pBt = pPage->pBt;
+  pPage->max1bytePayload = pBt->max1bytePayload;
+  if( flagByte>=(PTF_ZERODATA | PTF_LEAF) ){
+    pPage->childPtrSize = 0;
+    pPage->leaf = 1;
+    if( flagByte==(PTF_LEAFDATA | PTF_INTKEY | PTF_LEAF) ){   /* 0x0d table leaf */
+      pPage->intKeyLeaf = 1;
+      pPage->xCellSize  = cellSizePtrTableLeaf;
+      pPage->xParseCell = btreeParseCellPtr;
+      pPage->intKey = 1;
+      pPage->maxLocal = pBt->maxLeaf;
+      pPage->minLocal = pBt->minLeaf;
+    }else if( flagByte==(PTF_ZERODATA | PTF_LEAF) ){          /* 0x0a index leaf */
+      pPage->xCellSize  = cellSizePtrIdxLeaf;
+      pPage->xParseCell = btreeParseCellPtrIndex;
+      pPage->maxLocal = pBt->maxLocal;
+      pPage->minLocal = pBt->minLocal;
+    }else{
+      return SQLITE_CORRUPT_PAGE(pPage);
+    }
+  }else{
+    pPage->childPtrSize = 4;
+    pPage->leaf = 0;
+    /* ... 0x02 interior index / 0x05 interior table ... */
+  }
+  return SQLITE_OK;
+}
+```
+
+Three things to notice:
+
+1. **`xParseCell` and `xCellSize` are function pointers installed here.** The four cell
+   formats from `knowledge.md` §1.4 are four different parser functions, selected once per
+   page instead of branching per cell. When you later read `insertCell` or
+   `balance_nonroot` and see `pPage->xParseCell(pPage, pCell, &info)`, this is where that
+   pointer came from.
+2. **Any other flag byte is corruption**, returned immediately — not asserted. Asserts are
+   for *our* bugs; corrupt input is an expected condition.
+3. `maxLocal`/`minLocal` are copied from `BtShared`, where they were computed **once**:
+
+```c
+pBt->maxLocal = (u16)((pBt->usableSize-12)*64/255 - 23);
+pBt->minLocal = (u16)((pBt->usableSize-12)*32/255 - 23);
+pBt->maxLeaf  = (u16)(pBt->usableSize - 35);
+pBt->minLeaf  = (u16)((pBt->usableSize-12)*32/255 - 23);
+```
+
+That is the **spill formula** from `knowledge.md` §1.7, verbatim, evaluated once per open
+database. `X = U - 35` for table leaves; `X = ((U-12)*64/255)-23` for index pages;
+`M = ((U-12)*32/255)-23`. Your `dbparse.c` recomputes these per cell — SQLite does not.
+
+---
+
+## 4. `btreeParseCellPtr()` — a table-leaf cell, decoded
+
+This is the hottest parsing function in SQLite. Real code (comments are the originals):
+
+```c
+static void btreeParseCellPtr(
+  MemPage *pPage,         /* Page containing the cell */
+  u8 *pCell,              /* Pointer to the cell text. */
+  CellInfo *pInfo         /* Fill in this structure */
+){
+  u8 *pIter;
+  u32 nPayload;
+  u64 iKey;
+
+  assert( pPage->intKeyLeaf );
+  assert( pPage->childPtrSize==0 );
+  pIter = pCell;
+
+  /* The next block of code is equivalent to:
+  **     pIter += getVarint32(pIter, nPayload);
+  ** The code is inlined to avoid a function call.
+  */
+  nPayload = *pIter;
+  if( nPayload>=0x80 ){
+    u8 *pEnd = &pIter[8];
+    nPayload &= 0x7f;
+    do{
+      nPayload = (nPayload<<7) | (*++pIter & 0x7f);
+    }while( (*pIter)>=0x80 && pIter<pEnd );
+  }
+  pIter++;
+
+  /* The next block of code is equivalent to:
+  **     pIter += getVarint(pIter, (u64*)&pInfo->nKey);
+  ** The code is inlined and the loop is unrolled for performance.
+  ** This routine is a high-runner.
+  */
+  iKey = *pIter;
+  if( iKey>=0x80 ){
+    u8 x;
+    iKey = (iKey<<7) ^ (x = *++pIter);
+    if( x>=0x80 ){
+      iKey = (iKey<<7) ^ (x = *++pIter);
+      if( x>=0x80 ){
+        iKey = (iKey<<7) ^ 0x10204000 ^ (x = *++pIter);
+        /* ... nested to nine levels ... */
+      }else{
+        iKey ^= 0x204000;
+      }
+    }else{
+      iKey ^= 0x4000;
+    }
+  }
+  pIter++;
+
+  pInfo->nKey = *(i64*)&iKey;
+  pInfo->nPayload = nPayload;
+  pInfo->pPayload = pIter;
+  if( nPayload<=pPage->maxLocal ){
+    /* This is the (easy) common case where the entire payload fits
+    ** on the local page.  No overflow is required. */
+    pInfo->nSize = (u16)nPayload + (u16)(pIter - pCell);
+    if( pInfo->nSize<4 ) pInfo->nSize = 4;
+    pInfo->nLocal = (u16)nPayload;
+  }else{
+    btreeParseCellAdjustSizeForOverflow(pPage, pCell, pInfo);
+  }
+}
+```
+
+Walk it against the cell layout `[varint P][varint rowid][payload]`:
+
+| Code | Meaning |
+|---|---|
+| `assert( pPage->intKeyLeaf ); assert( pPage->childPtrSize==0 );` | the contract: **this parser is only for 0x0d table-leaf pages.** That is why `decodeFlags` installs it per page type. |
+| the `nPayload` block | decode `P`, the total payload size. Inlined rather than calling `getVarint32`, because the call overhead is measurable here. |
+| `pEnd = &pIter[8]` | a bound so a corrupt, never-terminating varint cannot run off the page. |
+| the nested `iKey` block | decode the rowid. The `^ 0x4000`, `^ 0x204000`, `^ 0x10204000` constants undo the sign bits that were shifted in by `(iKey<<7)` — an XOR-based way to strip continuation bits without masking each byte. Pure speed; the logic is identical to your `getVarint()`. |
+| `pInfo->pPayload = pIter;` | the payload starts right after the two varints. Note it is a **pointer into the page buffer** — zero copy, and invalid after the page moves (the rule from Phase 3). |
+| `if( nPayload<=pPage->maxLocal )` | **the spill test**, using the precomputed `maxLocal`. |
+| `if( pInfo->nSize<4 ) pInfo->nSize = 4;` | minimum cell size is 4 bytes, because a freeblock needs 4 bytes (2-byte next + 2-byte size) to exist. The *free-space* format constrains the *cell* format. |
+| `btreeParseCellAdjustSizeForOverflow(...)` | the `K`/`M` arithmetic, moved out of line because it is rare. |
+
+**The pattern to carry forward:** common case inline and branch-free-ish; rare case in a
+separate function; corruption bounded, not asserted.
+
+---
+
+## 5. `sqlite3VdbeSerialGet()` — serial types become values
+
+Real code, `src/vdbemem.c`:
+
+```c
+SQLITE_PRIVATE void sqlite3VdbeSerialGet(
+  const unsigned char *buf,     /* Buffer to deserialize from */
+  u32 serial_type,              /* Serial type to deserialize */
+  Mem *pMem                     /* Memory cell to write value into */
+){
+  switch( serial_type ){
+    case 10: { /* Internal use only: NULL with virtual table
+               ** UPDATE no-change flag set */
+      pMem->flags = MEM_Null|MEM_Zero;
+      pMem->n = 0;
+      pMem->u.nZero = 0;
+      return;
+    }
+    case 11:   /* Reserved for future use */
+    case 0: {  /* Null */
+      /* EVIDENCE-OF: R-24078-09375 Value is a NULL. */
+      pMem->flags = MEM_Null;
+      return;
+    }
+    case 1: {
+      /* EVIDENCE-OF: R-44885-25196 Value is an 8-bit twos-complement integer. */
+      pMem->u.i = ONE_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return;
+    }
+    case 5: { /* 6-byte signed integer */
+      /* EVIDENCE-OF: R-50385-09674 Value is a big-endian 48-bit
+      ** twos-complement integer. */
+      pMem->u.i = FOUR_BYTE_UINT(buf+2) + (((i64)1)<<32)*TWO_BYTE_INT(buf);
+      pMem->flags = MEM_Int;
+      testcase( pMem->u.i<0 );
+      return;
+    }
+    /* ... cases 2,3,4,6,7,8,9 and the text/blob default ... */
+  }
+}
+```
+
+What to take from it:
+
+- **This `switch` is the serial-type table from `knowledge.md` §1.6, executable.** Read the
+  cases in order and you have re-derived the table.
+- `/* EVIDENCE-OF: R-24078-09375 ... */` — each tag ties this line to a numbered sentence in
+  the published file-format specification, so the test suite can prove every documented
+  requirement is implemented **and** exercised. When you want the authoritative meaning of
+  a line, search the tag on sqlite.org.
+- `testcase( pMem->u.i<0 );` — a coverage marker asserting that the suite feeds this case
+  both a negative and a non-negative value. Sign handling in hand-rolled integer decoders
+  is exactly where bugs live.
+- Case 5 (48-bit) is the fun one: there is no 6-byte load, so it is assembled as
+  `high 16 bits × 2³² + low 32 bits`, with the high half read **signed** (`TWO_BYTE_INT`)
+  so sign extension is free.
+- Cases 10 and 11 are reserved and never appear in a valid file — seeing one means
+  corruption (or an internal vtab value that never reaches disk).
+
+---
+
+## 6. Do not read these — understand them and move on
+
+| Function | Why it is skippable | What it does |
+|---|---|---|
+| [`sqlite3BtreeIntegrityCheck`](https://github.com/sqlite/sqlite/blob/master/src/btree.c) | ~500 lines of cross-checks | Walks every b-tree, marks every page in a bitmap, verifies each page is referenced exactly once, checks cell ordering, overflow chain lengths, ptrmap entries, and free-space accounting. It is the invariant list from `internals_important.md` in executable form. Read it when you need the exact wording of an error message. |
+| `accessPayload()` | dense pointer arithmetic + overflow-chain walk | Reads or writes `amt` bytes at `offset` of a payload, hopping overflow pages, optionally bypassing the cache (`SQLITE_DIRECT_OVERFLOW_READ`). Its complexity is caching and partial reads, not format. |
+| `btreeInitPage()` | short but assert-heavy | Validates a page read from disk and fills in the `MemPage` derived fields — the read-side mirror of `zeroPage`. |
+
+---
+
+## 7. Exercises against real source
+
+Answer in `labs/phase01/source-questions.md`, citing `src/file.c` + function name:
+
+1. Find the `getVarint32()` **macro** (not the function). What does it do before calling
+   `sqlite3GetVarint32`, and why is that split worth it?
+2. In `zeroPage()`, why must `put2byte(&data[hdr+5], pBt->usableSize)` use *usable* size
+   rather than page size? Construct a database where the difference matters (hint: Apple's
+   build reserves 12 bytes).
+3. `decodeFlags()` returns `SQLITE_CORRUPT_PAGE` for an unknown flag byte — but it still
+   assigns `xParseCell` first. Why?
+4. Find `cellSizePtrTableLeaf()` and explain how it computes a cell's size without fully
+   parsing it.
+5. Find the `EVIDENCE-OF` tag for serial type 9 (integer constant 1) and quote the
+   specification sentence it implements.
+6. In `btreeParseCellPtr`, what would go wrong if `pEnd = &pIter[8]` were removed and the
+   file were corrupt?
+
+```sh
+A=~/Desktop/sqllite/sqlite-amalgamation-3500400
+grep -n "define getVarint32" $A/sqlite3.c
+grep -n "EVIDENCE-OF: R-.*integer 1\|constant 1" $A/sqlite3.c | head
+sed -n '/^static u16 cellSizePtrTableLeaf(/,/^}/p' $A/sqlite3.c
+```
