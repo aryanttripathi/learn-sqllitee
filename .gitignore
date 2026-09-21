@@ -36,3 +36,5 @@ labs/*/udf
 .idea/
 *.iml
 .vscode/
+labs/*/cdemo
+labs/*/demo.bin

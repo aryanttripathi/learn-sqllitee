@@ -3,20 +3,27 @@
 Goal: take you from "I use `SELECT`" to "I can read `btree.c`, explain why a page split
 happened, and write a patch that survives the SQLite test suite."
 
-Everything here is organized as **phases**. Each phase directory contains five documents:
+Everything here is organized as **phases**. Each phase directory contains six documents:
 
 | File | Purpose |
 |---|---|
-| `knowledge.md` | The concepts, with diagrams. Read first. |
-| `code_walkthrough.md` | **Real SQLite C, annotated line by line**, plus the mental model for reading that layer. Large functions are explained by mechanism with a source link. |
-| `implementation.md` | Hands-on labs. Real C, real hexdumps, real experiments. |
-| `internals_important.md` | The dense reference: files, structs, functions, invariants, gotchas. |
-| `mcq.md` | ~25 multiple-choice questions with explained answers. |
-| `assessment.md` | Build-something tasks + rubric. You are not done until these pass. |
+| `1.knowledge.md` | **The layer explained in depth** — the problem it solves, HLD, LLD, mermaid diagrams, the *why* behind every design decision, disk-level reality, and the misconceptions to unlearn. |
+| `2.code_walkthrough.md` | **Real SQLite C, annotated line by line**, plus the mental model for reading that layer. Large functions are explained by mechanism with a source link instead of being pasted. |
+| `3.implementation.md` | Hands-on labs. Real C, real hexdumps, real experiments. |
+| `4.internals_important.md` | The dense reference: files, structs, functions, constants, invariants, gotchas. |
+| `5.mcq.md` | ~25 multiple-choice questions with explained answers. |
+| `6.assessment.md` | Build-something tasks + rubric. You are not done until these pass. |
 
-Start with **[`READING-THE-CODE.md`](READING-THE-CODE.md)** — the three-pass method, naming
-conventions, what to skip, and how to trace a query through all six layers. Every
-`code_walkthrough.md` applies that method to one layer.
+Read them in number order.
+
+Two root documents come before Phase 0:
+
+| File | Purpose |
+|---|---|
+| **[`C-FOR-SQLITE.md`](C-FOR-SQLITE.md)** | The fourteen C techniques SQLite actually uses — first-member subclassing, function-pointer vtables, unions, bit flags, flexible arrays, big-endian by hand, sign extension, `memmove` vs `memcpy`, `goto` cleanup — each with a memory diagram and a runnable demo (`labs/c-primer/cdemo.c`). Ends with how a byte physically reaches the disk. |
+| **[`READING-THE-CODE.md`](READING-THE-CODE.md)** | The three-pass reading method, naming conventions, the four landmark design comments hidden in the source, how to trace a query with lldb, and an explicit list of what to skip. |
+
+Every `2.code_walkthrough.md` applies that method to one layer.
 
 ---
 
@@ -25,46 +32,28 @@ conventions, what to skip, and how to trace a query through all six layers. Ever
 SQLite is not a server. It is a **C library** that turns SQL text into bytes on one file.
 The entire stack is a pipeline, and every layer has a single job:
 
-```
-                         ┌──────────────────────────────┐
-   sqlite3_prepare_v2()  │        INTERFACE             │  main.c, legacy.c
-   sqlite3_step()        │  (the ~250 C API functions)  │  vdbeapi.c
-   sqlite3_column_*()    └──────────────┬───────────────┘
-                                        │ SQL text
-   ┌────────────────────────────────────▼───────────────────────────┐
-   │                        COMPILER (front end)                    │
-   │                                                                │
-   │  Tokenizer  ───►  Parser (Lemon LALR(1))  ───►  Parse tree     │
-   │  tokenize.c       parse.y -> parse.c            Expr/Select/   │
-   │                                                 SrcList/Table  │
-   │                                                                │
-   │  Name resolution (resolve.c) ─► Query planner (where.c) ─►     │
-   │  Code generator (select.c insert.c update.c delete.c expr.c)   │
-   └────────────────────────────────┬───────────────────────────────┘
-                                    │ bytecode program (Vdbe)
-   ┌────────────────────────────────▼───────────────────────────────┐
-   │                 VIRTUAL MACHINE  (vdbe.c)                      │
-   │  A register machine. ~190 opcodes. Cursors over b-trees.       │
-   │  One giant switch(). This is where the query actually "runs".  │
-   └────────────────────────────────┬───────────────────────────────┘
-                                    │ BtreeInsert / BtreeNext / BtreePayload
-   ┌────────────────────────────────▼───────────────────────────────┐
-   │                      B-TREE  (btree.c)                         │
-   │  Ordered key/value store. Table b-trees (rowid ➜ record),      │
-   │  index b-trees (key ➜ nothing). Page split/merge, balancing.   │
-   └────────────────────────────────┬───────────────────────────────┘
-                                    │ getPage / write / commit
-   ┌────────────────────────────────▼───────────────────────────────┐
-   │              PAGER  (pager.c + wal.c + pcache.c)               │
-   │  ACID: journal or WAL, page cache, locking, rollback, recovery │
-   └────────────────────────────────┬───────────────────────────────┘
-                                    │ xRead / xWrite / xLock / xSync
-   ┌────────────────────────────────▼───────────────────────────────┐
-   │                 OS INTERFACE / VFS (os_unix.c, os_win.c)       │
-   │  The only place SQLite touches the operating system.           │
-   └────────────────────────────────────────────────────────────────┘
-                                    │
-                              one .db file
+```mermaid
+flowchart TD
+    API["INTERFACE — the public C API<br/>sqlite3_open · prepare_v2 · bind · step · column<br/>main.c · vdbeapi.c · prepare.c"]
+    subgraph COMP["COMPILER — SQL text to a program"]
+        TOK["Tokenizer — tokenize.c"]
+        PAR["Parser — parse.y to parse.c, Lemon LALR-1"]
+        RES["Name resolution — resolve.c"]
+        PLAN["Query planner — where.c"]
+        GEN["Code generator — select.c · expr.c · insert.c"]
+        TOK --> PAR --> RES --> PLAN --> GEN
+    end
+    VM["VIRTUAL MACHINE — vdbe.c<br/>a register machine, ~190 opcodes, one switch"]
+    BT["B-TREE — btree.c<br/>ordered key/value on pages, split and balance"]
+    PG["PAGER — pager.c · wal.c · pcache1.c<br/>ACID: journal or WAL, cache, locking, recovery"]
+    OS["VFS — os_unix.c · os_win.c<br/>the only place SQLite touches the OS"]
+    DB[("one .db file")]
+    API -->|"SQL text"| COMP
+    COMP -->|"bytecode program"| VM
+    VM -->|"cursor operations"| BT
+    BT -->|"page requests"| PG
+    PG -->|"read / write / lock / sync"| OS
+    OS --> DB
 ```
 
 Two sentences worth memorizing:
@@ -133,13 +122,14 @@ Useful flags to compile with while learning:
 
 ## How to study (do not skip this)
 
-0. Read `READING-THE-CODE.md` once, before Phase 0.
-1. Read `knowledge.md` once, fast. Don't chase every detail.
-2. Read `code_walkthrough.md` with the source open in another window.
-3. Do every lab in `implementation.md`. **Typing the hexdump out by hand is the point.**
-4. Keep `internals_important.md` open while reading real source.
-5. Take `mcq.md` cold. Below 80% ⇒ reread.
-6. Ship `assessment.md`. Put your artifacts in `labs/phaseNN/`.
+0. Read `C-FOR-SQLITE.md` and run `labs/c-primer/cdemo`. Then `READING-THE-CODE.md`.
+1. Read `1.knowledge.md` properly — it carries the architecture, the diagrams, and the
+   reasoning. Do not skim it; the later documents assume it.
+2. Read `2.code_walkthrough.md` with the real source open in another window.
+3. Do every lab in `3.implementation.md`. **Typing the hexdump out by hand is the point.**
+4. Keep `4.internals_important.md` open while reading real source.
+5. Take `5.mcq.md` cold. Below 80% ⇒ reread.
+6. Ship `6.assessment.md`. Put your artifacts in `labs/phaseNN/`.
 
 A rule that will save you months: **when confused, dump bytes.** SQLite has no hidden state.
 Everything is in the file, the WAL, or the bytecode — and all three are printable.

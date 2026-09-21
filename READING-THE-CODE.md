@@ -293,10 +293,10 @@ Repeat for `INSERT`, then for a join, and the codebase stops being opaque.
 
 ## 11. Per-phase walkthroughs
 
-Each phase directory now contains **`code_walkthrough.md`**: real, annotated SQLite C for
+Each phase directory now contains **`2.code_walkthrough.md`**: real, annotated SQLite C for
 that layer, chosen to be short enough to read line by line. Large functions
 (`balance_nonroot`, `sqlite3VdbeExec`, `wherePathSolver`) are explained by *mechanism* with
 a link to the source rather than pasted in full — reading 700 lines of redistribution logic
 on a page is not how anyone learns it.
 
-Use them in this order: `knowledge.md` → `code_walkthrough.md` → `implementation.md`.
+Use them in this order: `1.knowledge.md` → `2.code_walkthrough.md` → `3.implementation.md`.

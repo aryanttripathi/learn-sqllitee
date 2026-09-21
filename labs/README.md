@@ -1,11 +1,12 @@
 # Labs — working code, already built and verified
 
 Every tool here was compiled and run on this machine while the curriculum was written.
-They are starting points, not finished products — each phase's `implementation.md` lists
+They are starting points, not finished products — each phase's `3.implementation.md` lists
 the extensions you are expected to add.
 
 | Path | What it is | Verified |
 |---|---|---|
+| `c-primer/cdemo.c` | Every C technique SQLite uses, printed with real output: struct padding, bit flags, unions, first-member subclassing, flexible arrays, big-endian, sign extension, varints, `goto` cleanup, `memmove` | ✅ all 12 sections run |
 | `phase01/dbparse.c` | Dependency-free SQLite **database file** parser: header, b-tree walk, cell + record decode, spill formulas | ✅ decodes real tables and indexes |
 | `phase02/tracevfs.c` | **VFS shim** that logs every OS call (read/write/sync/lock/shm) | ✅ shows the full commit protocol |
 | `phase03/minibtree.c` | A miniature **slotted-page B+tree** with splits, in SQLite's shape | ✅ 50k seq + 50k random inserts, all checks green |
